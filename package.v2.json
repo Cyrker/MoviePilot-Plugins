@@ -3,12 +3,13 @@
     "name": "SSD 卸载到 HDD",
     "description": "整理完成后调用 qBittorrent setLocation，把 SSD 缓存盘上的种子数据搬到机械盘，不掉种。配合 自动转移做种 插件实现「下载到SSD → 整理上传网盘 → 搬运到HDD → 转交TR保种」全自动闭环。",
     "labels": "做种,Qbittorrent,下载管理",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "icon": "ssdoffload.png",
     "author": "Cyrker",
     "level": 1,
     "history": {
-      "v1.0.0": "首个版本：监听 TransferComplete 事件，自动从 SSD 把种子搬到剩余空间最多的 HDD。"
+      "v1.1.0": "下载器选择改为下拉框，从 MP 已配置的 qBittorrent 下载器中选择",
+      "v1.0.0": "首个版本：监听 TransferComplete 事件，自动从 SSD 把种子搬到剩余空间最多的 HDD"
     }
   }
 }
