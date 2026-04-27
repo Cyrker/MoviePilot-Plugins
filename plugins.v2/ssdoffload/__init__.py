@@ -32,9 +32,9 @@ from app.schemas.types import EventType, NotificationType
 class SsdOffload(_PluginBase):
     # ---- 插件元信息 ----
     plugin_name = "SSD 卸载到 HDD"
-    plugin_desc = "整理完成后把 qb 中位于 SSD 缓存盘的种子数据搬到机械盘，搬运由 qb setLocation 完成，不掉种。"
+    plugin_desc = "整理完成后把位于 SSD 缓存盘的种子数据搬到机械盘，调用下载器原生 API（qBittorrent setLocation / Transmission moveTorrentData），不掉种。"
     plugin_icon = "https://raw.githubusercontent.com/Cyrker/MoviePilot-Plugins/main/icons/ssdoffload.png"
-    plugin_version = "1.2.0"
+    plugin_version = "1.3.0"
     plugin_author = "Cyrker"
     author_url = "https://github.com/Cyrker/MoviePilot-Plugins"
     plugin_config_prefix = "ssdoffload_"
@@ -175,11 +175,11 @@ class SsdOffload(_PluginBase):
             )
             return
 
-        # 找到 qb 客户端
-        qb_service = self._get_qb_service(downloader_name)
-        if qb_service is None:
+        # 找到源下载器服务
+        src_service = self._get_source_service(downloader_name)
+        if src_service is None:
             logger.warning(
-                f"【SsdOffload】未找到可用的 qBittorrent 下载器 (filter={self._downloader_name})"
+                f"【SsdOffload】未找到可用的源下载器 (filter={self._downloader_name})"
             )
             return
 
@@ -188,17 +188,17 @@ class SsdOffload(_PluginBase):
         if delay:
             t = threading.Thread(
                 target=self._delayed_move,
-                args=(qb_service, download_hash, src_path, delay),
+                args=(src_service, download_hash, src_path, delay),
                 daemon=True,
             )
             t.start()
         else:
-            self._do_move(qb_service, download_hash, src_path)
+            self._do_move(src_service, download_hash, src_path)
 
-    def _delayed_move(self, qb_service, download_hash: str, src_path: str, delay: int):
+    def _delayed_move(self, src_service, download_hash: str, src_path: str, delay: int):
         time.sleep(delay)
         try:
-            self._do_move(qb_service, download_hash, src_path)
+            self._do_move(src_service, download_hash, src_path)
         except Exception as e:
             logger.error(
                 f"【SsdOffload】延时搬运异常 hash={download_hash}: {e}\n{traceback.format_exc()}"
@@ -207,35 +207,27 @@ class SsdOffload(_PluginBase):
     # ---------------------------------------------------------------------
     # 核心搬运逻辑
     # ---------------------------------------------------------------------
-    def _do_move(self, qb_service, download_hash: str, src_path: str):
-        qb_client = self._extract_qbittorrent_api(qb_service)
-        if qb_client is None:
-            logger.error("【SsdOffload】无法获取 qbittorrent-api 实例")
+    def _do_move(self, src_service, download_hash: str, src_path: str):
+        svc_type = self._get_service_type(src_service) or "unknown"
+        info = self._query_torrent(src_service, download_hash)
+        if info is None:
+            logger.warning(
+                f"【SsdOffload】下载器（{svc_type}）中找不到种子 hash={download_hash}"
+            )
             return
 
-        # 取这条种当前的 save_path
-        try:
-            torrents = qb_client.torrents_info(torrent_hashes=download_hash)
-        except Exception as e:
-            logger.error(f"【SsdOffload】查询种子 {download_hash} 失败: {e}")
-            return
-        if not torrents:
-            logger.warning(f"【SsdOffload】qb 中找不到种子 hash={download_hash}")
-            return
-        torrent = torrents[0]
-        current_save_path: str = (torrent.save_path or "").rstrip("/")
-        torrent_name: str = torrent.name or ""
-        torrent_size: int = int(torrent.size or 0)
-        torrent_tags: str = torrent.tags or ""
+        current_save_path = info["save_path"].rstrip("/")
+        torrent_name = info["name"]
+        torrent_size = int(info["size"] or 0)
+        torrent_tags: List[str] = info.get("tags") or []
+        progress = float(info.get("progress") or 0.0)
 
         # 标签过滤
-        if self._required_tag:
-            tags = [t.strip() for t in torrent_tags.split(",") if t.strip()]
-            if self._required_tag not in tags:
-                logger.debug(
-                    f"【SsdOffload】种子 {torrent_name} 缺少标签 {self._required_tag}，跳过"
-                )
-                return
+        if self._required_tag and self._required_tag not in torrent_tags:
+            logger.debug(
+                f"【SsdOffload】种子 {torrent_name} 缺少标签 {self._required_tag}，跳过"
+            )
+            return
 
         # 校验当前确实在 SSD 上
         if not self._is_under(current_save_path, self._ssd_prefix):
@@ -257,8 +249,7 @@ class SsdOffload(_PluginBase):
             target_hdd if not relative else f"{target_hdd}/{relative}"
         )
 
-        # 容错：如果种子本身已经下载完成才能搬（qb 在搬运过程中会暂停 IO，未完成的会被打断）
-        progress = float(torrent.progress or 0)
+        # 容错：种子完成后才能搬（搬运过程中 IO 会暂停，未完成的会被打断）
         if progress < 1.0:
             logger.info(
                 f"【SsdOffload】种子 {torrent_name} 进度 {progress*100:.1f}% 未完成，跳过"
@@ -269,38 +260,36 @@ class SsdOffload(_PluginBase):
         if self._dry_run:
             logger.info(
                 f"【SsdOffload】[DRY RUN] 将搬运 {torrent_name} "
-                f"({torrent_size/1024/1024/1024:.2f} GB): {current_save_path} -> {new_save_path}"
+                f"({torrent_size/1024/1024/1024:.2f} GB) via {svc_type}: "
+                f"{current_save_path} -> {new_save_path}"
             )
             return
 
-        # 真·调用 qb setLocation
-        # qb 在跨盘场景下会以 copy+delete 方式完成搬运，期间种子会变成 "moving" 状态，
-        # 完成后自动恢复做种，原始 SSD 上的文件被删除
+        # 提前建目录避免边界情况（下载器自己也会建）
         try:
-            logger.info(
-                f"【SsdOffload】开始搬运 {torrent_name} "
-                f"({torrent_size/1024/1024/1024:.2f} GB): {current_save_path} -> {new_save_path}"
-            )
-            # 确保目标父目录存在（qb 自己也会建，但提前建一下避免边界情况）
-            try:
-                Path(new_save_path).mkdir(parents=True, exist_ok=True)
-            except Exception as e:
-                logger.warning(f"【SsdOffload】创建目录 {new_save_path} 失败（可继续）：{e}")
-            qb_client.torrents_set_location(
-                location=new_save_path, torrent_hashes=download_hash
-            )
-            logger.info(f"【SsdOffload】setLocation 已下发: {torrent_name}")
+            Path(new_save_path).mkdir(parents=True, exist_ok=True)
         except Exception as e:
+            logger.warning(f"【SsdOffload】创建目录 {new_save_path} 失败（可继续）：{e}")
+
+        logger.info(
+            f"【SsdOffload】开始搬运 {torrent_name} "
+            f"({torrent_size/1024/1024/1024:.2f} GB) via {svc_type}: "
+            f"{current_save_path} -> {new_save_path}"
+        )
+        ok, err = self._move_torrent(src_service, download_hash, new_save_path)
+        if not ok:
             logger.error(
-                f"【SsdOffload】setLocation 失败 hash={download_hash}: {e}\n{traceback.format_exc()}"
+                f"【SsdOffload】搬运失败 ({svc_type}) hash={download_hash}: {err}"
             )
             if self._notify:
                 self.post_message(
                     mtype=NotificationType.Plugin,
                     title="【SSD 卸载到 HDD】搬运失败",
-                    text=f"种子: {torrent_name}\n错误: {e}",
+                    text=f"种子: {torrent_name}\n下载器: {svc_type}\n错误: {err}",
                 )
             return
+
+        logger.info(f"【SsdOffload】搬运指令已下发: {torrent_name}")
 
         if self._notify:
             self.post_message(
@@ -308,9 +297,10 @@ class SsdOffload(_PluginBase):
                 title="【SSD 卸载到 HDD】已下发搬运",
                 text=(
                     f"种子: {torrent_name}\n"
+                    f"下载器: {svc_type}\n"
                     f"大小: {torrent_size/1024/1024/1024:.2f} GB\n"
                     f"{current_save_path}\n→\n{new_save_path}\n"
-                    f"qb 后台搬运中，搬完会自动继续做种。"
+                    f"下载器后台搬运中，搬完会自动继续做种。"
                 ),
             )
 
@@ -350,34 +340,114 @@ class SsdOffload(_PluginBase):
         candidates.sort(key=lambda x: x[1], reverse=True)
         return candidates[0][0]
 
-    def _get_qb_service(self, downloader_name: Optional[str]):
-        """取出 qBittorrent 类型的下载器服务实例。"""
+    def _get_source_service(self, event_downloader_name: Optional[str]):
+        """取出源下载器服务实例（任意支持搬运的类型）。"""
         helper = self.downloader_helper or DownloaderHelper()
 
         # 优先按用户配置 / 事件给的下载器名称取
         candidate_names: List[str] = []
         if self._downloader_name:
             candidate_names.append(self._downloader_name)
-        if downloader_name and downloader_name not in candidate_names:
-            candidate_names.append(downloader_name)
+        if event_downloader_name and event_downloader_name not in candidate_names:
+            candidate_names.append(event_downloader_name)
 
         for name in candidate_names:
             try:
                 svc = helper.get_service(name=name)
-                if svc and self._is_qbittorrent_service(svc):
+                if svc and self._service_supports_move(svc):
                     return svc
             except Exception as e:
                 logger.debug(f"【SsdOffload】get_service({name}) 失败: {e}")
 
-        # 兜底：扫一遍所有下载器，挑第一个 qb
+        # 兜底：扫一遍所有下载器，挑第一个支持搬运的
         try:
             services = helper.get_services() or {}
             for svc in services.values():
-                if self._is_qbittorrent_service(svc):
+                if self._service_supports_move(svc):
                     return svc
         except Exception as e:
             logger.debug(f"【SsdOffload】get_services 失败: {e}")
         return None
+
+    def _service_supports_move(self, svc) -> bool:
+        return self._get_service_type(svc) in ("qbittorrent", "transmission")
+
+    # ---------------------------------------------------------------------
+    # 下载器适配层：屏蔽 qb / tr 之间的 API 差异
+    # ---------------------------------------------------------------------
+    def _query_torrent(self, svc, torrent_hash: str) -> Optional[Dict[str, Any]]:
+        """统一查询接口，返回 {name, size, save_path, progress(0-1), tags(List[str])}。"""
+        svc_type = self._get_service_type(svc)
+        try:
+            if svc_type == "qbittorrent":
+                return self._query_qb(svc, torrent_hash)
+            if svc_type == "transmission":
+                return self._query_tr(svc, torrent_hash)
+        except Exception as e:
+            logger.error(
+                f"【SsdOffload】查询种子失败 ({svc_type}) hash={torrent_hash}: {e}"
+            )
+        return None
+
+    def _move_torrent(self, svc, torrent_hash: str, new_path: str) -> Tuple[bool, str]:
+        """统一搬运接口，返回 (是否成功, 错误信息)。"""
+        svc_type = self._get_service_type(svc)
+        try:
+            if svc_type == "qbittorrent":
+                client = self._extract_qbittorrent_api(svc)
+                if client is None:
+                    return False, "无法获取 qbittorrent 客户端"
+                client.torrents_set_location(
+                    location=new_path, torrent_hashes=torrent_hash
+                )
+                return True, ""
+            if svc_type == "transmission":
+                client = self._extract_transmission_api(svc)
+                if client is None:
+                    return False, "无法获取 transmission 客户端"
+                client.move_torrent_data(ids=torrent_hash, location=new_path)
+                return True, ""
+            return False, f"不支持的下载器类型: {svc_type or 'unknown'}"
+        except Exception as e:
+            return False, f"{e}\n{traceback.format_exc()}"
+
+    @staticmethod
+    def _query_qb(svc, torrent_hash: str) -> Optional[Dict[str, Any]]:
+        client = SsdOffload._extract_qbittorrent_api(svc)
+        if client is None:
+            return None
+        torrents = client.torrents_info(torrent_hashes=torrent_hash)
+        if not torrents:
+            return None
+        t = torrents[0]
+        tags = [s.strip() for s in (t.tags or "").split(",") if s.strip()]
+        return {
+            "name": t.name or "",
+            "size": int(t.size or 0),
+            "save_path": (t.save_path or ""),
+            "progress": float(t.progress or 0.0),
+            "tags": tags,
+        }
+
+    @staticmethod
+    def _query_tr(svc, torrent_hash: str) -> Optional[Dict[str, Any]]:
+        client = SsdOffload._extract_transmission_api(svc)
+        if client is None:
+            return None
+        torrent = client.get_torrent(torrent_hash)
+        if torrent is None:
+            return None
+        progress = float(getattr(torrent, "progress", 0.0) or 0.0)
+        # transmission_rpc progress 可能为 0-100，归一化到 0-1
+        if progress > 1.0:
+            progress = progress / 100.0
+        return {
+            "name": getattr(torrent, "name", "") or "",
+            "size": int(getattr(torrent, "total_size", 0) or 0),
+            "save_path": getattr(torrent, "download_dir", "") or "",
+            "progress": progress,
+            "tags": list(getattr(torrent, "labels", []) or []),
+        }
 
     def _get_downloader_options(self) -> List[Dict[str, str]]:
         """枚举 MP 中所有已启用的下载器，供下拉框使用，标题附带类型。"""
@@ -422,23 +492,6 @@ class SsdOffload(_PluginBase):
         return ""
 
     @staticmethod
-    def _is_qbittorrent_service(svc) -> bool:
-        # 通过类名或者 type 属性识别 qb
-        try:
-            cls_name = type(getattr(svc, "instance", svc)).__name__.lower()
-            if "qbittorrent" in cls_name:
-                return True
-        except Exception:
-            pass
-        try:
-            t = getattr(svc, "type", "") or ""
-            if str(t).lower() == "qbittorrent":
-                return True
-        except Exception:
-            pass
-        return False
-
-    @staticmethod
     def _extract_qbittorrent_api(svc):
         """从 MP 的 qb 服务对象里拿到 qbittorrentapi.Client。
 
@@ -453,6 +506,24 @@ class SsdOffload(_PluginBase):
             return client
         # 兜底：instance 本身可能就是 qbittorrentapi.Client
         if hasattr(instance, "torrents_set_location"):
+            return instance
+        return None
+
+    @staticmethod
+    def _extract_transmission_api(svc):
+        """从 MP 的 tr 服务对象里拿到 transmission_rpc.Client。
+
+        常见层级:
+            svc.instance        -> Transmission 包装类
+            svc.instance.trc    -> transmission_rpc.Client
+        若拿不到包装属性，则兜底检查 instance 自身是否就是 client。
+        """
+        instance = getattr(svc, "instance", None) or svc
+        for attr in ("trc", "tr", "client", "_client"):
+            c = getattr(instance, attr, None)
+            if c is not None and hasattr(c, "move_torrent_data"):
+                return c
+        if hasattr(instance, "move_torrent_data"):
             return instance
         return None
 
@@ -663,9 +734,10 @@ class SsdOffload(_PluginBase):
                             "type": "info",
                             "variant": "tonal",
                             "text": (
-                                "工作原理：监听 MoviePilot 的 TransferComplete 事件，"
-                                "当源文件位于 SSD 前缀下时，调用 qb 的 setLocation API 把数据搬到 HDD。"
-                                "搬运由 qb 后台完成，做种不掉。容器路径映射要保证 MP / qb / tr 三者完全一致。"
+                                "工作原理：监听 TransferComplete 事件，源文件位于 SSD 前缀下时，"
+                                "对源下载器调用其原生搬运 API（qBittorrent: setLocation；Transmission: moveTorrentData），"
+                                "数据由下载器后台搬到 HDD，期间种子保持做种。"
+                                "容器路径在所有下载器与 MP 中需完全一致。"
                             ),
                         },
                     },
