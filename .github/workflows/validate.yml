@@ -1,0 +1,77 @@
+name: Validate Plugins
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate package.v2.json structure
+        run: |
+          python3 - <<'PY'
+          import json, re, sys, pathlib
+
+          root = pathlib.Path(".")
+          pkg_path = root / "package.v2.json"
+          if not pkg_path.exists():
+              print("::error::package.v2.json missing")
+              sys.exit(1)
+          pkg = json.loads(pkg_path.read_text(encoding="utf-8"))
+
+          required_fields = {"name", "description", "version", "icon", "author", "level", "history"}
+          plugins_dir = root / "plugins.v2"
+          errors = []
+
+          for plugin_id, meta in pkg.items():
+              missing = required_fields - meta.keys()
+              if missing:
+                  errors.append(f"{plugin_id}: missing fields {missing}")
+                  continue
+
+              # Plugin source must exist
+              src = plugins_dir / plugin_id.lower() / "__init__.py"
+              if not src.exists():
+                  errors.append(f"{plugin_id}: source file {src} not found")
+                  continue
+
+              # plugin_version in source must match version in package.v2.json
+              text = src.read_text(encoding="utf-8")
+              m = re.search(r'plugin_version\s*=\s*["\']([^"\']+)["\']', text)
+              if not m:
+                  errors.append(f"{plugin_id}: plugin_version not found in {src}")
+              elif m.group(1) != meta["version"]:
+                  errors.append(
+                      f"{plugin_id}: plugin_version={m.group(1)} but package.v2.json version={meta['version']}"
+                  )
+
+              # version must be in history
+              if meta["version"] not in {k.lstrip("v") for k in meta["history"]} \
+                  and f"v{meta['version']}" not in meta["history"] \
+                  and meta["version"] not in meta["history"]:
+                  errors.append(
+                      f"{plugin_id}: version {meta['version']} not described in history"
+                  )
+
+              # Icon (filename) must exist if not a URL
+              icon = meta["icon"]
+              if not icon.startswith("http"):
+                  if not (root / "icons" / icon).exists():
+                      errors.append(f"{plugin_id}: icon icons/{icon} not found")
+
+          if errors:
+              for e in errors:
+                  print(f"::error::{e}")
+              sys.exit(1)
+          print(f"OK - {len(pkg)} plugin(s) validated")
+          PY
