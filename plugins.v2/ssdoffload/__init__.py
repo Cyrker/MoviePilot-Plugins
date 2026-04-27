@@ -34,7 +34,7 @@ class SsdOffload(_PluginBase):
     plugin_name = "SSD 卸载到 HDD"
     plugin_desc = "整理完成后把 qb 中位于 SSD 缓存盘的种子数据搬到机械盘，搬运由 qb setLocation 完成，不掉种。"
     plugin_icon = "https://raw.githubusercontent.com/Cyrker/MoviePilot-Plugins/main/icons/ssdoffload.png"
-    plugin_version = "1.1.0"
+    plugin_version = "1.2.0"
     plugin_author = "Cyrker"
     author_url = "https://github.com/Cyrker/MoviePilot-Plugins"
     plugin_config_prefix = "ssdoffload_"
@@ -48,6 +48,7 @@ class SsdOffload(_PluginBase):
     _hdd_prefixes: List[str] = []
     _strategy: str = "most_free"
     _downloader_name: str = ""
+    _target_downloader_name: str = ""
     _required_tag: str = ""
     _delay_seconds: int = 5
     _dry_run: bool = False
@@ -78,6 +79,7 @@ class SsdOffload(_PluginBase):
             ]
         self._strategy = config.get("strategy") or "most_free"
         self._downloader_name = (config.get("downloader_name") or "").strip()
+        self._target_downloader_name = (config.get("target_downloader_name") or "").strip()
         self._required_tag = (config.get("required_tag") or "").strip()
         try:
             self._delay_seconds = int(config.get("delay_seconds") or 5)
@@ -88,7 +90,9 @@ class SsdOffload(_PluginBase):
         logger.info(
             f"【SsdOffload】初始化完成: enabled={self._enabled}, "
             f"ssd={self._ssd_prefix}, hdd={self._hdd_prefixes}, "
-            f"strategy={self._strategy}, downloader={self._downloader_name or '默认'}, "
+            f"strategy={self._strategy}, "
+            f"downloader={self._downloader_name or '默认'}, "
+            f"target_downloader={self._target_downloader_name or '未指定'}, "
             f"tag={self._required_tag or '无'}, delay={self._delay_seconds}s, "
             f"dry_run={self._dry_run}"
         )
@@ -376,7 +380,7 @@ class SsdOffload(_PluginBase):
         return None
 
     def _get_downloader_options(self) -> List[Dict[str, str]]:
-        """枚举 MP 中已配置的 qBittorrent 下载器，供下拉框使用。"""
+        """枚举 MP 中所有已启用的下载器，供下拉框使用，标题附带类型。"""
         options: List[Dict[str, str]] = []
         try:
             helper = self.downloader_helper or DownloaderHelper()
@@ -386,8 +390,6 @@ class SsdOffload(_PluginBase):
             return options
 
         for name, svc in services.items():
-            if not self._is_qbittorrent_service(svc):
-                continue
             enabled = getattr(svc, "enabled", None)
             if enabled is None:
                 config = getattr(svc, "config", None)
@@ -397,8 +399,27 @@ class SsdOffload(_PluginBase):
                     enabled = True
             if not enabled:
                 continue
-            options.append({"title": name, "value": name})
+            svc_type = self._get_service_type(svc)
+            title = f"{name}（{svc_type}）" if svc_type else name
+            options.append({"title": title, "value": name})
         return options
+
+    @staticmethod
+    def _get_service_type(svc) -> str:
+        try:
+            t = getattr(svc, "type", "") or ""
+            if t:
+                return str(t).lower()
+        except Exception:
+            pass
+        try:
+            cls_name = type(getattr(svc, "instance", svc)).__name__.lower()
+            for kw in ("qbittorrent", "transmission", "deluge", "rtorrent", "aria2"):
+                if kw in cls_name:
+                    return kw
+        except Exception:
+            pass
+        return ""
 
     @staticmethod
     def _is_qbittorrent_service(svc) -> bool:
@@ -565,16 +586,16 @@ class SsdOffload(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
+                                "props": {"cols": 12, "md": 6},
                                 "content": [
                                     {
                                         "component": "VSelect",
                                         "props": {
                                             "model": "downloader_name",
-                                            "label": "下载器（可选）",
+                                            "label": "下载器1：源（运行下载任务）",
                                             "items": downloader_options,
                                             "clearable": True,
-                                            "hint": "从 MP 已配置的 qBittorrent 中选择，留空则自动挑第一个可用",
+                                            "hint": "从 MP 已配置的下载器中选择；留空则自动挑第一个可用的 qBittorrent",
                                             "persistent-hint": True,
                                         },
                                     }
@@ -582,7 +603,29 @@ class SsdOffload(_PluginBase):
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VSelect",
+                                        "props": {
+                                            "model": "target_downloader_name",
+                                            "label": "下载器2：目标（接管做种）",
+                                            "items": downloader_options,
+                                            "clearable": True,
+                                            "hint": "标记将由哪个下载器接管做种（如 Transmission），用于后续闭环",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
                                 "content": [
                                     {
                                         "component": "VTextField",
@@ -598,7 +641,7 @@ class SsdOffload(_PluginBase):
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
+                                "props": {"cols": 12, "md": 6},
                                 "content": [
                                     {
                                         "component": "VTextField",
@@ -636,6 +679,7 @@ class SsdOffload(_PluginBase):
             "hdd_prefixes": "/media/disk1-8T\n/media/disk2-16T\n/media/disk3-16T",
             "strategy": "most_free",
             "downloader_name": "",
+            "target_downloader_name": "",
             "required_tag": "",
             "delay_seconds": 5,
         }
