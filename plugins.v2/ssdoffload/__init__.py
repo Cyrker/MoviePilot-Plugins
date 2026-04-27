@@ -375,6 +375,31 @@ class SsdOffload(_PluginBase):
             logger.debug(f"【SsdOffload】get_services 失败: {e}")
         return None
 
+    def _get_downloader_options(self) -> List[Dict[str, str]]:
+        """枚举 MP 中已配置的 qBittorrent 下载器，供下拉框使用。"""
+        options: List[Dict[str, str]] = []
+        try:
+            helper = self.downloader_helper or DownloaderHelper()
+            services = helper.get_services() or {}
+        except Exception as e:
+            logger.warning(f"【SsdOffload】获取下载器列表失败: {e}")
+            return options
+
+        for name, svc in services.items():
+            if not self._is_qbittorrent_service(svc):
+                continue
+            enabled = getattr(svc, "enabled", None)
+            if enabled is None:
+                config = getattr(svc, "config", None)
+                if config is not None:
+                    enabled = getattr(config, "enabled", True)
+                else:
+                    enabled = True
+            if not enabled:
+                continue
+            options.append({"title": name, "value": name})
+        return options
+
     @staticmethod
     def _is_qbittorrent_service(svc) -> bool:
         # 通过类名或者 type 属性识别 qb
@@ -426,6 +451,7 @@ class SsdOffload(_PluginBase):
     # UI 配置表单
     # ---------------------------------------------------------------------
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
+        downloader_options = self._get_downloader_options()
         return [
             {
                 "component": "VForm",
@@ -542,12 +568,13 @@ class SsdOffload(_PluginBase):
                                 "props": {"cols": 12, "md": 4},
                                 "content": [
                                     {
-                                        "component": "VTextField",
+                                        "component": "VSelect",
                                         "props": {
                                             "model": "downloader_name",
-                                            "label": "下载器名称（可选）",
-                                            "placeholder": "qbittorrent",
-                                            "hint": "为空则自动挑第一个 qb",
+                                            "label": "下载器（可选）",
+                                            "items": downloader_options,
+                                            "clearable": True,
+                                            "hint": "从 MP 已配置的 qBittorrent 中选择，留空则自动挑第一个可用",
                                             "persistent-hint": True,
                                         },
                                     }
