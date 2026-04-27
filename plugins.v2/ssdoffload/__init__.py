@@ -34,7 +34,7 @@ class SsdOffload(_PluginBase):
     plugin_name = "SSD 卸载到 HDD"
     plugin_desc = "整理完成后把 qb 中位于 SSD 缓存盘的种子数据搬到机械盘，搬运由 qb setLocation 完成，不掉种。"
     plugin_icon = "https://raw.githubusercontent.com/Cyrker/MoviePilot-Plugins/main/icons/ssdoffload.png"
-    plugin_version = "1.0.0"
+    plugin_version = "1.1.0"
     plugin_author = "Cyrker"
     author_url = "https://github.com/Cyrker/MoviePilot-Plugins"
     plugin_config_prefix = "ssdoffload_"
