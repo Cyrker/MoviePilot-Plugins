@@ -35,7 +35,7 @@ class SsdOffload(_PluginBase):
     plugin_name = "SSD 卸载到 HDD"
     plugin_desc = "MP 上传 115 完成后，调用源 qBittorrent 的 setLocation 把 SSD 缓存盘上的种子数据搬到预配置的 HDD，不掉种。后续做种交接由「自动转移做种」插件完成。"
     plugin_icon = "https://raw.githubusercontent.com/Cyrker/MoviePilot-Plugins/main/icons/ssdoffload.png"
-    plugin_version = "1.4.0"
+    plugin_version = "1.4.1"
     plugin_author = "Cyrker"
     author_url = "https://github.com/Cyrker/MoviePilot-Plugins"
     plugin_config_prefix = "ssdoffload_"
@@ -49,7 +49,6 @@ class SsdOffload(_PluginBase):
     _hdd_prefixes: List[str] = []
     _strategy: str = "most_free"
     _downloader_name: str = ""
-    _target_downloader_name: str = ""
     _required_tag: str = ""
     _delay_seconds: int = 5
     _dry_run: bool = False
@@ -80,7 +79,6 @@ class SsdOffload(_PluginBase):
             ]
         self._strategy = config.get("strategy") or "most_free"
         self._downloader_name = (config.get("downloader_name") or "").strip()
-        self._target_downloader_name = (config.get("target_downloader_name") or "").strip()
         self._required_tag = (config.get("required_tag") or "").strip()
         try:
             self._delay_seconds = int(config.get("delay_seconds") or 5)
@@ -93,7 +91,6 @@ class SsdOffload(_PluginBase):
             f"ssd={self._ssd_prefix}, hdd={self._hdd_prefixes}, "
             f"strategy={self._strategy}, "
             f"downloader={self._downloader_name or '默认'}, "
-            f"target_downloader={self._target_downloader_name or '未指定'}, "
             f"tag={self._required_tag or '无'}, delay={self._delay_seconds}s, "
             f"dry_run={self._dry_run}"
         )
@@ -308,25 +305,26 @@ class SsdOffload(_PluginBase):
             if self._notify and not silent:
                 self.post_message(
                     mtype=NotificationType.Plugin,
-                    title="【SSD 卸载到 HDD】搬运失败",
-                    text=f"种子: {torrent_name}\n错误: {e}",
+                    title="SSD 卸载到 HDD｜搬运失败",
+                    text=(
+                        f"种子：{torrent_name}\n"
+                        f"原因：{e}"
+                    ),
                 )
             return "failed"
 
         if self._notify and not silent:
-            handoff = (
-                f"\n后续由 [{self._target_downloader_name}] 接管做种"
-                if self._target_downloader_name
-                else ""
-            )
             self.post_message(
                 mtype=NotificationType.Plugin,
-                title="【SSD 卸载到 HDD】已下发搬运",
+                title="SSD 卸载到 HDD｜qb 已开始搬运",
                 text=(
-                    f"种子: {torrent_name}\n"
-                    f"大小: {torrent_size/1024/1024/1024:.2f} GB\n"
-                    f"{current_save_path}\n→\n{new_save_path}{handoff}\n"
-                    f"qb 后台搬运中，搬完会自动继续做种。"
+                    f"种子：{torrent_name}\n"
+                    f"大小：{torrent_size/1024/1024/1024:.2f} GB\n"
+                    f"\n"
+                    f"原路径：{current_save_path}\n"
+                    f"新路径：{new_save_path}\n"
+                    f"\n"
+                    f"qb 正在后台 copy+delete，完成后保持做种、不掉种。"
                 ),
             )
         return "moved"
@@ -346,7 +344,7 @@ class SsdOffload(_PluginBase):
             if self._notify:
                 self.post_message(
                     mtype=NotificationType.Plugin,
-                    title="【SSD 卸载到 HDD】立刻运行一次",
+                    title="SSD 卸载到 HDD｜立刻运行一次",
                     text=msg,
                 )
             return
@@ -383,8 +381,11 @@ class SsdOffload(_PluginBase):
             if self._notify:
                 self.post_message(
                     mtype=NotificationType.Plugin,
-                    title="【SSD 卸载到 HDD】立刻运行一次",
-                    text="未找到符合条件的种子（SSD 前缀下、已完成、标签匹配）",
+                    title="SSD 卸载到 HDD｜立刻运行一次",
+                    text=(
+                        "未找到符合条件的种子。\n"
+                        "（要求：当前位于 SSD 前缀下、进度 100%、可选标签匹配）"
+                    ),
                 )
             return
 
@@ -405,13 +406,23 @@ class SsdOffload(_PluginBase):
             else:
                 skipped += 1
 
-        summary = f"扫描 {total} / 已下发 {moved} / 跳过 {skipped} / 失败 {failed}"
-        logger.info(f"【SsdOffload】立刻运行一次完成：{summary}")
+        summary_log = (
+            f"扫描 {total} / 已开始 {moved} / 跳过 {skipped} / 失败 {failed}"
+        )
+        logger.info(f"【SsdOffload】立刻运行一次完成：{summary_log}")
         if self._notify:
             self.post_message(
                 mtype=NotificationType.Plugin,
-                title="【SSD 卸载到 HDD】立刻运行一次",
-                text=summary,
+                title="SSD 卸载到 HDD｜立刻运行一次完成",
+                text=(
+                    f"共扫描到 {total} 个符合条件的种子\n"
+                    f"\n"
+                    f"已开始搬运：{moved}\n"
+                    f"跳过：{skipped}\n"
+                    f"失败：{failed}\n"
+                    f"\n"
+                    f"qb 正在后台 copy+delete，搬完保持做种。"
+                ),
             )
 
     # ---------------------------------------------------------------------
@@ -685,16 +696,16 @@ class SsdOffload(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
+                                "props": {"cols": 12, "md": 4},
                                 "content": [
                                     {
                                         "component": "VSelect",
                                         "props": {
                                             "model": "downloader_name",
-                                            "label": "下载器1：源（运行下载任务）",
+                                            "label": "源下载器（qBittorrent）",
                                             "items": downloader_options,
                                             "clearable": True,
-                                            "hint": "搬运仅支持 qBittorrent；非 qb 类型会被跳过并兜底挑第一个 qb",
+                                            "hint": "搬运仅支持 qBittorrent；留空自动挑第一个可用",
                                             "persistent-hint": True,
                                         },
                                     }
@@ -702,29 +713,7 @@ class SsdOffload(_PluginBase):
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
-                                "content": [
-                                    {
-                                        "component": "VSelect",
-                                        "props": {
-                                            "model": "target_downloader_name",
-                                            "label": "下载器2：目标（接管做种）",
-                                            "items": downloader_options,
-                                            "clearable": True,
-                                            "hint": "标记将由哪个下载器接管做种（如 Transmission），用于后续闭环",
-                                            "persistent-hint": True,
-                                        },
-                                    }
-                                ],
-                            },
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
+                                "props": {"cols": 12, "md": 4},
                                 "content": [
                                     {
                                         "component": "VTextField",
@@ -740,7 +729,7 @@ class SsdOffload(_PluginBase):
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
+                                "props": {"cols": 12, "md": 4},
                                 "content": [
                                     {
                                         "component": "VTextField",
@@ -765,9 +754,8 @@ class SsdOffload(_PluginBase):
                                 "工作原理：MP 上传 115 完成后触发 TransferComplete 事件，"
                                 "对源 qBittorrent 调用 setLocation 把 SSD 上的种子数据搬到预配置的 HDD，"
                                 "qb 后台 copy+delete 完成搬运、做种不掉。"
-                                "「下载器2」仅作标识用（接管做种的下载器，例如 Transmission），"
-                                "本插件不会主动操作它，由「自动转移做种」插件完成交接。"
-                                "容器路径在 MP 与所有下载器中需完全一致。"
+                                "TR 接管做种由「自动转移做种」插件完成，本插件不操作。"
+                                "容器路径在 MP 与下载器中需完全一致。"
                             ),
                         },
                     },
@@ -782,7 +770,6 @@ class SsdOffload(_PluginBase):
             "hdd_prefixes": "/media/disk1-8T\n/media/disk2-16T\n/media/disk3-16T",
             "strategy": "most_free",
             "downloader_name": "",
-            "target_downloader_name": "",
             "required_tag": "",
             "delay_seconds": 5,
         }
