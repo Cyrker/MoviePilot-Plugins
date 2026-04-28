@@ -35,7 +35,7 @@ class SsdOffload(_PluginBase):
     plugin_name = "SSD 卸载到 HDD"
     plugin_desc = "MP 上传 115 完成后，调用源 qBittorrent 的 setLocation 把 SSD 缓存盘上的种子数据搬到预配置的 HDD，不掉种。后续做种交接由「自动转移做种」插件完成。"
     plugin_icon = "https://raw.githubusercontent.com/Cyrker/MoviePilot-Plugins/main/icons/ssdoffload.png"
-    plugin_version = "1.3.1"
+    plugin_version = "1.4.0"
     plugin_author = "Cyrker"
     author_url = "https://github.com/Cyrker/MoviePilot-Plugins"
     plugin_config_prefix = "ssdoffload_"
@@ -97,6 +97,17 @@ class SsdOffload(_PluginBase):
             f"tag={self._required_tag or '无'}, delay={self._delay_seconds}s, "
             f"dry_run={self._dry_run}"
         )
+
+        # 「立刻运行一次」：写回 False 并起一个后台线程跑批扫
+        if bool(config.get("run_once")):
+            config["run_once"] = False
+            try:
+                self.update_config(config)
+            except Exception as e:
+                logger.warning(f"【SsdOffload】写回 run_once=False 失败（不影响执行）: {e}")
+            threading.Thread(
+                target=self._run_once_batch, daemon=True, name="SsdOffloadRunOnce"
+            ).start()
 
     def get_state(self) -> bool:
         return bool(
@@ -189,17 +200,17 @@ class SsdOffload(_PluginBase):
         if delay:
             t = threading.Thread(
                 target=self._delayed_move,
-                args=(src_service, download_hash, src_path, delay),
+                args=(src_service, download_hash, delay),
                 daemon=True,
             )
             t.start()
         else:
-            self._do_move(src_service, download_hash, src_path)
+            self._do_move(src_service, download_hash)
 
-    def _delayed_move(self, src_service, download_hash: str, src_path: str, delay: int):
+    def _delayed_move(self, src_service, download_hash: str, delay: int):
         time.sleep(delay)
         try:
-            self._do_move(src_service, download_hash, src_path)
+            self._do_move(src_service, download_hash)
         except Exception as e:
             logger.error(
                 f"【SsdOffload】延时搬运异常 hash={download_hash}: {e}\n{traceback.format_exc()}"
@@ -208,20 +219,24 @@ class SsdOffload(_PluginBase):
     # ---------------------------------------------------------------------
     # 核心搬运逻辑
     # ---------------------------------------------------------------------
-    def _do_move(self, qb_service, download_hash: str, src_path: str):
+    def _do_move(self, qb_service, download_hash: str, *, silent: bool = False) -> str:
+        """搬运一个种子。返回 'moved' / 'skipped' / 'failed'。
+
+        silent=True 时抑制单条搬运通知（用于批扫，由调用方汇总）。
+        """
         qb_client = self._extract_qbittorrent_api(qb_service)
         if qb_client is None:
             logger.error("【SsdOffload】无法获取 qbittorrent-api 实例")
-            return
+            return "failed"
 
         try:
             torrents = qb_client.torrents_info(torrent_hashes=download_hash)
         except Exception as e:
             logger.error(f"【SsdOffload】查询种子 {download_hash} 失败: {e}")
-            return
+            return "failed"
         if not torrents:
             logger.warning(f"【SsdOffload】qb 中找不到种子 hash={download_hash}")
-            return
+            return "skipped"
 
         torrent = torrents[0]
         current_save_path = (torrent.save_path or "").rstrip("/")
@@ -235,20 +250,20 @@ class SsdOffload(_PluginBase):
             logger.debug(
                 f"【SsdOffload】种子 {torrent_name} 缺少标签 {self._required_tag}，跳过"
             )
-            return
+            return "skipped"
 
         # 校验当前确实在 SSD 上
         if not self._is_under(current_save_path, self._ssd_prefix):
             logger.info(
                 f"【SsdOffload】种子 {torrent_name} 当前 save_path={current_save_path} 已不在 SSD，跳过"
             )
-            return
+            return "skipped"
 
         # 选目标 HDD 前缀，并算出新的 save_path
         target_hdd = self._pick_target_hdd(torrent_size)
         if not target_hdd:
             logger.error("【SsdOffload】没有可用的 HDD 前缀（全部不可达或空间不足）")
-            return
+            return "failed"
 
         # 用前缀替换的方式保留 SSD 上的子目录结构
         # 例: /media/disk4-150G/downloads/电影  ->  /media/disk2-16T/downloads/电影
@@ -262,14 +277,14 @@ class SsdOffload(_PluginBase):
             logger.info(
                 f"【SsdOffload】种子 {torrent_name} 进度 {progress*100:.1f}% 未完成，跳过"
             )
-            return
+            return "skipped"
 
         if self._dry_run:
             logger.info(
                 f"【SsdOffload】[DRY RUN] 将搬运 {torrent_name} "
                 f"({torrent_size/1024/1024/1024:.2f} GB): {current_save_path} -> {new_save_path}"
             )
-            return
+            return "skipped"
 
         # 提前建目录避免边界情况（qb 自己也会建）
         try:
@@ -290,15 +305,15 @@ class SsdOffload(_PluginBase):
             logger.error(
                 f"【SsdOffload】setLocation 失败 hash={download_hash}: {e}\n{traceback.format_exc()}"
             )
-            if self._notify:
+            if self._notify and not silent:
                 self.post_message(
                     mtype=NotificationType.Plugin,
                     title="【SSD 卸载到 HDD】搬运失败",
                     text=f"种子: {torrent_name}\n错误: {e}",
                 )
-            return
+            return "failed"
 
-        if self._notify:
+        if self._notify and not silent:
             handoff = (
                 f"\n后续由 [{self._target_downloader_name}] 接管做种"
                 if self._target_downloader_name
@@ -313,6 +328,90 @@ class SsdOffload(_PluginBase):
                     f"{current_save_path}\n→\n{new_save_path}{handoff}\n"
                     f"qb 后台搬运中，搬完会自动继续做种。"
                 ),
+            )
+        return "moved"
+
+    # ---------------------------------------------------------------------
+    # 立刻运行一次：扫全量符合条件的种子并批量搬
+    # ---------------------------------------------------------------------
+    def _run_once_batch(self):
+        if not self.get_state():
+            logger.warning("【SsdOffload】立刻运行一次：插件未启用或必填项未配置，跳过")
+            return
+
+        src_service = self._get_source_service(None)
+        if src_service is None:
+            msg = "未找到可用的 qBittorrent，已中止"
+            logger.warning(f"【SsdOffload】立刻运行一次：{msg}")
+            if self._notify:
+                self.post_message(
+                    mtype=NotificationType.Plugin,
+                    title="【SSD 卸载到 HDD】立刻运行一次",
+                    text=msg,
+                )
+            return
+
+        qb_client = self._extract_qbittorrent_api(src_service)
+        if qb_client is None:
+            logger.error("【SsdOffload】立刻运行一次：无法获取 qbittorrent-api 实例")
+            return
+
+        try:
+            all_torrents = qb_client.torrents_info()
+        except Exception as e:
+            logger.error(f"【SsdOffload】立刻运行一次：列出种子失败: {e}")
+            return
+
+        # 先按 SSD 前缀 / 完成度 / 标签过滤一遍，避免无效 _do_move 调用
+        matched_hashes: List[str] = []
+        for t in all_torrents:
+            save_path = (t.save_path or "").rstrip("/")
+            if not self._is_under(save_path, self._ssd_prefix):
+                continue
+            if float(t.progress or 0) < 1.0:
+                continue
+            if self._required_tag:
+                tags = [s.strip() for s in (t.tags or "").split(",") if s.strip()]
+                if self._required_tag not in tags:
+                    continue
+            matched_hashes.append(t.hash)
+
+        total = len(matched_hashes)
+        logger.info(f"【SsdOffload】立刻运行一次：扫描到 {total} 个符合条件的种子")
+
+        if total == 0:
+            if self._notify:
+                self.post_message(
+                    mtype=NotificationType.Plugin,
+                    title="【SSD 卸载到 HDD】立刻运行一次",
+                    text="未找到符合条件的种子（SSD 前缀下、已完成、标签匹配）",
+                )
+            return
+
+        moved = skipped = failed = 0
+        for h in matched_hashes:
+            try:
+                res = self._do_move(src_service, h, silent=True)
+            except Exception as e:
+                logger.error(
+                    f"【SsdOffload】立刻运行一次：搬运 {h} 异常: {e}\n{traceback.format_exc()}"
+                )
+                failed += 1
+                continue
+            if res == "moved":
+                moved += 1
+            elif res == "failed":
+                failed += 1
+            else:
+                skipped += 1
+
+        summary = f"扫描 {total} / 已下发 {moved} / 跳过 {skipped} / 失败 {failed}"
+        logger.info(f"【SsdOffload】立刻运行一次完成：{summary}")
+        if self._notify:
+            self.post_message(
+                mtype=NotificationType.Plugin,
+                title="【SSD 卸载到 HDD】立刻运行一次",
+                text=summary,
             )
 
     # ---------------------------------------------------------------------
@@ -466,7 +565,7 @@ class SsdOffload(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
+                                "props": {"cols": 12, "md": 3},
                                 "content": [
                                     {
                                         "component": "VSwitch",
@@ -479,7 +578,7 @@ class SsdOffload(_PluginBase):
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
+                                "props": {"cols": 12, "md": 3},
                                 "content": [
                                     {
                                         "component": "VSwitch",
@@ -492,13 +591,29 @@ class SsdOffload(_PluginBase):
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
+                                "props": {"cols": 12, "md": 3},
                                 "content": [
                                     {
                                         "component": "VSwitch",
                                         "props": {
                                             "model": "dry_run",
                                             "label": "仅日志（不实际搬）",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "run_once",
+                                            "label": "立刻运行一次",
+                                            "color": "warning",
+                                            "hint": "保存后立即扫一遍 qb 全量种子，符合条件的批量搬到 HDD；执行完自动重置",
+                                            "persistent-hint": True,
                                         },
                                     }
                                 ],
@@ -662,6 +777,7 @@ class SsdOffload(_PluginBase):
             "enabled": False,
             "notify": False,
             "dry_run": False,
+            "run_once": False,
             "ssd_prefix": "/media/disk4-150G",
             "hdd_prefixes": "/media/disk1-8T\n/media/disk2-16T\n/media/disk3-16T",
             "strategy": "most_free",
